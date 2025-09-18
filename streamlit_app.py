@@ -27,7 +27,7 @@ import shutil
 import networkx as nx
 
 st.set_page_config(page_title="Process Mining — Bottlenecks & Loops", layout="wide")
-st.title("🚦 Bottle neck + 🔄 Зацикленность (подтипы) + 📌 DFG")
+st.title("Sber_mining")
 
 # =========================================================
 # 0) ХЕЛПЕРЫ
