@@ -1,0 +1,8 @@
+streamlit>=1.36
+pandas>=2.1
+pm4py==2.7.10
+matplotlib>=3.8
+seaborn>=0.13
+networkx>=3.2
+graphviz>=0.20.3
+pyarrow>=15
