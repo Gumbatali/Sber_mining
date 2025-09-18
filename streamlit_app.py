@@ -486,3 +486,4 @@ else:
             st.pyplot(fig, use_container_width=True)
         except Exception as e:
             st.warning(f"Фоллбэк PNG не удался: {e}")
+
