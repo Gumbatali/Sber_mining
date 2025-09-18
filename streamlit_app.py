@@ -1,5 +1,5 @@
 # streamlit_app.py
-# Process Mining — авто-поиск неэффективностей + DFG PNG с фоллбэком, если нет system graphviz
+# Process Mining — продвинутые неэффективности с подтипами (покейсно), PNG с фоллбэком
 
 import os
 import io
@@ -10,19 +10,25 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-import pm4py
-from pm4py.objects.log.util import dataframe_utils
-from pm4py.statistics.traces.generic.log import case_statistics
-from pm4py.visualization.dfg import visualizer as dfg_visualizer
+# --- мягкая проверка pm4py, чтобы апп не падал на Cloud ---
+try:
+    import pm4py
+    from pm4py.objects.log.util import dataframe_utils
+    from pm4py.visualization.dfg import visualizer as dfg_visualizer
+except ModuleNotFoundError:
+    st.set_page_config(page_title="Process Mining — зависимости")
+    st.error(
+        "Модуль **pm4py** не установлен. Для Streamlit Cloud добавь в `requirements.txt` "
+        "`pm4py>=2.7.11` (под Python 3.13) и опционально `graphviz` + `packages.txt: graphviz`."
+    )
+    st.stop()
 
 import matplotlib.pyplot as plt
-import shutil  # для проверки наличия 'dot'
-import networkx as nx  # фоллбэк-рендер DFG без graphviz
+import shutil
+import networkx as nx
 
-st.set_page_config(page_title="Process Mining — QA неэффективностей", layout="wide")
-st.title("🔍 Process Mining — авто-поиск неэффективностей")
-st.caption("Все кейсы анализируются в фоне. На экран выводятся только факты наличия неэффективностей и короткие примеры. "
-           "DFG PNG: system graphviz → красивый рендер; без него → упрощённый фоллбэк.")
+st.set_page_config(page_title="Process Mining — продвинутые неэффективности", layout="wide")
+st.title("🔍 Process Mining — продвинутые неэффективности (с подтипами)")
 
 # =========================
 # Загрузка
@@ -58,28 +64,35 @@ elif local_path.strip() and os.path.exists(local_path.strip()):
     st.info(f"Загружен локальный файл: {local_path.strip()}")
 
 if df is None or df.empty:
-    st.info("⬆️ Загрузите лог или укажите путь к файлу.")
+    st.info("⬆️ Загрузите лог или укажите путь.")
     st.stop()
 
 st.subheader("📊 Предпросмотр")
 st.dataframe(df.head(), use_container_width=True)
 
 # =========================
-# Маппинг + время
+# Маппинг + время (+ ресурс опционально для ping-pong по исполнителям)
 # =========================
 st.subheader("🧭 Маппинг колонок")
 cols = df.columns.tolist()
 col_case = st.selectbox("Колонка кейса", cols, index=0)
 col_act  = st.selectbox("Колонка активности", cols, index=min(1, len(cols)-1))
 col_ts   = st.selectbox("Колонка времени", cols, index=min(2, len(cols)-1))
+col_res_opt = st.selectbox("Колонка ресурса/исполнителя (опционально)", ["<нет>"] + cols, index=0)
 
 with st.expander("🕒 Парсинг времени", expanded=False):
     date_hint = st.text_input("Формат даты (опц.) например %Y-%m-%d %H:%M:%S", value="")
     coerce_ts = st.checkbox("Ошибочные даты → NaT", value=True)
     tz = st.text_input("Таймзона (например Europe/Moscow). Пусто — не менять", value="")
 
-df = df[[col_case, col_act, col_ts]].copy()
-df.columns = ["case_id", "activity", "timestamp"]
+use_resource = col_res_opt != "<нет>"
+
+keep_cols = [col_case, col_act, col_ts] + ([col_res_opt] if use_resource else [])
+df = df[keep_cols].copy()
+rename_map = {col_case: "case_id", col_act: "activity", col_ts: "timestamp"}
+if use_resource:
+    rename_map[col_res_opt] = "resource"
+df = df.rename(columns=rename_map)
 
 # to_datetime
 if date_hint.strip():
@@ -99,255 +112,444 @@ if tz.strip():
 
 na_share = df["timestamp"].isna().mean()
 if na_share > 0:
-    st.warning(f"⚠️ {na_share:.1%} значений времени → NaT (будут отброшены).")
+    st.warning(f"⚠️ {na_share:.1%} временных значений → NaT (будут отброшены).")
     df = df.dropna(subset=["timestamp"])
 
 df["case_id"] = df["case_id"].astype(str).str.strip()
 df["activity"] = df["activity"].astype(str).str.strip()
+if use_resource:
+    df["resource"] = df["resource"].astype(str).str.strip()
 df = df[(df["case_id"] != "") & (df["activity"] != "")]
 df = df.sort_values(["case_id", "timestamp"])
-
-events_per_case = df.groupby("case_id").size()
-if df.empty or events_per_case.max() < 2:
+if df.groupby("case_id").size().max() < 2:
     st.error("Нужно ≥2 события на кейс.")
     st.stop()
 
 # =========================
-# Производные метрики
+# Производные
 # =========================
 # PM4Py event log
-event_log = pm4py.format_dataframe(df, case_id="case_id", activity_key="activity", timestamp_key="timestamp")
+event_log = pm4py.format_dataframe(
+    df,
+    case_id="case_id",
+    activity_key="activity",
+    timestamp_key="timestamp",
+    resource_key=("resource" if use_resource else None)
+)
+from pm4py.objects.log.util import dataframe_utils
 event_log = dataframe_utils.convert_timestamp_columns_in_df(event_log)
 if "time:timestamp" in event_log.columns:
     event_log = event_log.sort_values(["case:concept:name", "time:timestamp"])
 else:
     event_log = event_log.sort_values(["case:concept:name"])
-
 n_cases = event_log["case:concept:name"].nunique()
 st.success(f"✅ Событий: {len(event_log):,} • Кейсов: {n_cases:,}")
 
-# Длительности кейсов
-case_dur_df = (
-    event_log.groupby("case:concept:name")["time:timestamp"]
-             .agg(start="min", end="max")
-             .assign(duration_sec=lambda x: (x["end"] - x["start"]).dt.total_seconds())
-             .rename_axis("case_id")
-             .reset_index()
-)
-
 # Межшаговые интервалы
 df_sorted = df.copy()
-df_sorted["next_activity"] = df_sorted.groupby("case_id")["activity"].shift(-1)
+df_sorted["next_activity"]  = df_sorted.groupby("case_id")["activity"].shift(-1)
 df_sorted["next_timestamp"] = df_sorted.groupby("case_id")["timestamp"].shift(-1)
+if use_resource:
+    df_sorted["resource_next"] = df_sorted.groupby("case_id")["resource"].shift(-1)
 df_sorted["delta_sec"] = (df_sorted["next_timestamp"] - df_sorted["timestamp"]).dt.total_seconds()
 edges = df_sorted.dropna(subset=["next_activity", "delta_sec"]).copy()
 edges["edge"] = list(zip(edges["activity"], edges["next_activity"]))
 
-# Глобальные статистики рёбер
 edge_stats = (
     edges.groupby("edge")["delta_sec"]
          .agg(median="median",
               p90=lambda s: np.percentile(s, 90),
               p95=lambda s: np.percentile(s, 95),
-              mean="mean",
-              std="std",
-              count="count")
+              p99=lambda s: np.percentile(s, 99),
+              mean="mean", std="std", count="count")
          .reset_index()
 )
 edge_stats_dict = edge_stats.set_index("edge").to_dict(orient="index")
 edge_median_map = {e: s["median"] for e, s in edge_stats_dict.items()}
-edge_p95_map = {e: s["p95"] for e, s in edge_stats_dict.items()}
+edge_p95_map    = {e: s["p95"]    for e, s in edge_stats_dict.items()}
+edge_p99_map    = {e: s["p99"]    for e, s in edge_stats_dict.items()}
 
 def safe_pct(series, q, default=np.nan) -> float:
     s = pd.Series(series).dropna()
     return float(np.percentile(s, q)) if not s.empty else default
 
 # =========================
-# Индикаторы (из презентации): Зацикленность • Длительность операции • Влияние
+# ИНДИКАТОРЫ И ПОДТИПЫ
 # =========================
-def loop_scores_for_case(sub: pd.DataFrame) -> Dict[str, int]:
+# ---------- 1) ЦИКЛЫ / ЗАЦИКЛЕННОСТЬ ----------
+def loop_subtypes_for_case(sub: pd.DataFrame, use_res: bool) -> Dict[str, int]:
+    """
+    Подтипы:
+      - self_loops: A→A (в себя)
+      - ping_pong: ABAB (или BABA). Если есть ресурс — также «ресурсный пинг-понг» (A@R1 → A@R2 → A@R1 → A@R2)
+      - returns_nonadj: возвраты к пройденным шагам (A … A, не соседние)
+      - jump_to_prev_any: переход в любой ранее встречавшийся шаг (edge-«откат»)
+      - back_to_start: возвраты к стартовой активности (… → A0)
+    """
     acts = sub["activity"].tolist()
+    res  = sub["resource"].tolist() if use_res else None
     if not acts:
-        return {"rework_total": 0, "adjacent_loops": 0, "cycle_returns": 0, "ab_cycle": 0, "loop_score": 0}
-    uniq, cnt = np.unique(acts, return_counts=True)
-    rework_total = int(np.sum(cnt[cnt > 1] - 1))
-    adjacent_loops = sum(1 for i in range(len(acts)-1) if acts[i] == acts[i+1])
-    last_pos, cycle_returns = {}, 0
+        return {k: 0 for k in
+                ["self_loops", "ping_pong", "ping_pong_res", "returns_nonadj", "jump_to_prev_any", "back_to_start", "loop_score_advanced"]}
+
+    # 1) self loops
+    self_loops = sum(1 for i in range(len(acts)-1) if acts[i] == acts[i+1])
+
+    # 2) ping-pong по активностям (ABAB, длина окна >=4)
+    ping_pong = 0
+    i = 0
+    while i+3 < len(acts):
+        a, b, c, d = acts[i:i+4]
+        if a != b and a == c and b == d:
+            ping_pong += 1
+            i += 2  # сдвиг на пол-шага, чтобы считать перекрытия умеренно
+        else:
+            i += 1
+
+    # 2b) ресурсный пинг-понг (одна и та же активность, но R1↔R2↔R1↔R2)
+    ping_pong_res = 0
+    if use_res:
+        i = 0
+        while i+3 < len(acts):
+            a1, r1 = acts[i],   res[i]
+            a2, r2 = acts[i+1], res[i+1]
+            a3, r3 = acts[i+2], res[i+2]
+            a4, r4 = acts[i+3], res[i+3]
+            # одна активность, но ресурсы чередуются
+            if a1 == a2 == a3 == a4 and len({r1, r2}) == 2 and r1 == r3 and r2 == r4:
+                ping_pong_res += 1
+                i += 2
+            else:
+                i += 1
+
+    # 3) возвраты к пройденным шагам (не соседние A…A)
+    returns_nonadj = 0
+    last_pos = {}
     for i, a in enumerate(acts):
         if a in last_pos and i - last_pos[a] > 1:
-            cycle_returns += 1
+            returns_nonadj += 1
         last_pos[a] = i
-    ab_cycle = 0
-    for i in range(len(acts)-3):
-        if acts[i] != acts[i+1] and acts[i] == acts[i+2] and acts[i+1] == acts[i+3]:
-            ab_cycle += 1
-    loop_score = rework_total + adjacent_loops + cycle_returns + ab_cycle
-    return dict(rework_total=rework_total, adjacent_loops=adjacent_loops,
-                cycle_returns=cycle_returns, ab_cycle=ab_cycle, loop_score=loop_score)
+
+    # 4) «прыжок в произвольный ранний этап»: переход, где next_activity уже встречалась ранее в трассе
+    jump_to_prev_any = 0
+    seen = set()
+    for i in range(len(acts)-1):
+        seen.add(acts[i])
+        if acts[i+1] in seen and acts[i+1] != acts[i]:
+            jump_to_prev_any += 1
+
+    # 5) возврат в начало (повтор стартовой активности)
+    start_act = acts[0]
+    back_to_start = sum(1 for i in range(1, len(acts)) if acts[i] == start_act)
+
+    loop_score_adv = self_loops + ping_pong + ping_pong_res + returns_nonadj + jump_to_prev_any + back_to_start
+    return {
+        "self_loops": self_loops,
+        "ping_pong": ping_pong,
+        "ping_pong_res": ping_pong_res,
+        "returns_nonadj": returns_nonadj,
+        "jump_to_prev_any": jump_to_prev_any,
+        "back_to_start": back_to_start,
+        "loop_score_advanced": loop_score_adv,
+    }
 
 loop_rows = []
 for cid, g in df.groupby("case_id"):
-    sc = loop_scores_for_case(g)
+    sc = loop_subtypes_for_case(g, use_resource)
     sc["case_id"] = cid
     loop_rows.append(sc)
 loops_df = pd.DataFrame(loop_rows)
-auto_loop_thr = int(np.ceil(safe_pct(loops_df["loop_score"], 75, default=1)))
 
-def overrun_for_case(sub_edges: pd.DataFrame) -> float:
-    over = 0.0
+# авто-пороги по подтипам (q75), общий — по сумме (q75)
+def q75(s): return int(np.ceil(safe_pct(s, 75, default=1)))
+thr_self   = q75(loops_df["self_loops"])
+thr_pp     = q75(loops_df["ping_pong"])
+thr_ppr    = q75(loops_df["ping_pong_res"]) if use_resource else 1
+thr_ret    = q75(loops_df["returns_nonadj"])
+thr_jump   = q75(loops_df["jump_to_prev_any"])
+thr_start  = q75(loops_df["back_to_start"])
+thr_loop_total = q75(loops_df["loop_score_advanced"])
+
+# ---------- 2) ДЛИТЕЛЬНОСТЬ ОПЕРАЦИЙ ----------
+# Подтипы:
+#   - single_spike: есть Δ > p99(edge) (хотя бы одно экстремально долгое ожидание)
+#   - many_moderate: суммарный overrun относительно median(edge) велик (q90)
+#   - queue_before_activity: систематический «хвост» перед конкретной активностью (много больших Δ на вход в один и тот же шаг)
+edge_median_map = {e: s["median"] for e, s in edge_stats_dict.items()}
+
+def per_case_overruns(sub_edges: pd.DataFrame):
+    single_spike = 0
+    overrun_sum  = 0.0
+    entry_waits  = {}  # вход в активность: … -> X
     for _, row in sub_edges.iterrows():
-        edge = (row["activity"], row["next_activity"])
+        e = (row["activity"], row["next_activity"])
         d = float(row["delta_sec"])
-        med = edge_median_map.get(edge, np.nan)
+        med = edge_median_map.get(e, np.nan)
+        p99 = edge_p99_map.get(e, np.nan)
         if not np.isnan(med):
-            over += max(0.0, d - float(med))
-    return over
+            overrun_sum += max(0.0, d - med)
+        if not np.isnan(p99) and d > p99:
+            single_spike += 1
+        # копим ожидания по входу в next_activity
+        entry_waits[row["next_activity"]] = entry_waits.get(row["next_activity"], 0.0) + d
+    # «очередь» — если на 1 активность приходится ≥ 40% суммарного ожидания кейса
+    total_wait = sum(entry_waits.values())
+    queue_flag = False
+    queue_target = None
+    if total_wait > 0:
+        best_act = max(entry_waits, key=entry_waits.get)
+        if entry_waits[best_act] / total_wait >= 0.40:
+            queue_flag = True
+            queue_target = best_act
+    return single_spike, overrun_sum, queue_flag, queue_target
 
 over_rows = []
 for cid, g in df_sorted.groupby("case_id"):
     sub_edges = g.dropna(subset=["next_activity", "delta_sec"])
-    over = overrun_for_case(sub_edges)
-    over_rows.append({"case_id": cid, "overrun_sum_sec": over})
+    ss, osum, qf, qtarget = per_case_overruns(sub_edges)
+    over_rows.append({"case_id": cid, "single_spike_cnt": ss, "overrun_sum_sec": osum,
+                      "queue_before_flag": qf, "queue_target": qtarget})
 over_df = pd.DataFrame(over_rows)
-auto_over_thr = float(np.ceil(safe_pct(over_df["overrun_sum_sec"], 90, default=0.0)))
 
-k_bottlenecks = st.sidebar.number_input("Top-k узких рёбер для метрики влияния", min_value=1, value=10, step=1)
-top_edges = edge_stats.sort_values("median", ascending=False).head(k_bottlenecks)["edge"].tolist()
-top_edge_set = set(top_edges)
+thr_over_sum   = float(np.ceil(safe_pct(over_df["overrun_sum_sec"], 90, default=0.0)))
+thr_over_spike = max(1, int(np.ceil(safe_pct(over_df["single_spike_cnt"], 75, default=1))))
 
-def impact_for_case(sub_edges: pd.DataFrame) -> Tuple[float, float, int]:
+# ---------- 3) ВЛИЯНИЕ НА ПРОЦЕСС ----------
+# Подтипы:
+#   - impact_sum: Σ(max(0, Δ - p95(edge))) — вклад кейса сверх типовых ожиданий
+#   - bottleneck_share: доля переходов по глобальным «узким» рёбрам (top-k по median)
+#   - p95_exceed_count: сколько раз кейс превышал p95 своих рёбер
+k_bottlenecks = st.sidebar.number_input("Top-k узких рёбер (для метрики влияния)", min_value=1, value=10, step=1)
+top_edges = set(edge_stats.sort_values("median", ascending=False).head(k_bottlenecks)["edge"].tolist())
+
+def impact_for_case(sub_edges: pd.DataFrame):
     if sub_edges.empty:
         return 0.0, 0.0, 0
-    impact_sum = 0.0
+    imp_sum = 0.0
     in_bneck = 0
+    exceed_cnt = 0
     n_edges = 0
     for _, row in sub_edges.iterrows():
-        edge = (row["activity"], row["next_activity"])
+        e = (row["activity"], row["next_activity"])
         d = float(row["delta_sec"])
-        p95 = edge_p95_map.get(edge, np.nan)
+        p95 = edge_p95_map.get(e, np.nan)
         n_edges += 1
-        if edge in top_edge_set:
+        if e in top_edges:
             in_bneck += 1
         if not np.isnan(p95):
-            impact_sum += max(0.0, d - float(p95))
-    frac_bneck = (in_bneck / n_edges) if n_edges else 0.0
-    return impact_sum, frac_bneck, n_edges
+            exc = d - p95
+            if exc > 0:
+                imp_sum += exc
+                exceed_cnt += 1
+    share = in_bneck / n_edges if n_edges else 0.0
+    return imp_sum, share, exceed_cnt
 
 impact_rows = []
 for cid, g in df_sorted.groupby("case_id"):
     sub_edges = g.dropna(subset=["next_activity", "delta_sec"])
-    imp_sum, frac_bneck, n_edges = impact_for_case(sub_edges)
-    impact_rows.append({"case_id": cid, "impact_sum_sec": imp_sum, "frac_bottleneck_edges": frac_bneck, "n_edges": n_edges})
+    isum, share, excnt = impact_for_case(sub_edges)
+    impact_rows.append({"case_id": cid, "impact_sum_sec": isum, "bneck_share": share, "p95_exceed_cnt": excnt})
 impact_df = pd.DataFrame(impact_rows)
-auto_impact_thr = float(np.ceil(safe_pct(impact_df["impact_sum_sec"], 90, default=0.0)))
-auto_frac_bneck_thr = float(np.round(safe_pct(impact_df["frac_bottleneck_edges"], 90, default=0.5), 2))
+
+thr_impact_sum   = float(np.ceil(safe_pct(impact_df["impact_sum_sec"], 90, default=0.0)))
+thr_bneck_share  = float(np.round(safe_pct(impact_df["bneck_share"], 90, default=0.5), 2))
+thr_exceed_cnt   = int(np.ceil(safe_pct(impact_df["p95_exceed_cnt"], 75, default=1)))
 
 # =========================
 # Режим: Авто / Ручной
 # =========================
 st.subheader("🧠 Пороговые значения")
 mode = st.radio("Режим порогов", ["Авто", "Ручной"], horizontal=True, index=0)
-if mode == "Авто":
-    loop_thr = auto_loop_thr
-    over_thr = auto_over_thr
-    impact_thr = auto_impact_thr
-    frac_bneck_thr = auto_frac_bneck_thr
-else:
-    c1, c2 = st.columns(2)
+if mode == "Ручной":
+    c1, c2, c3 = st.columns(3)
     with c1:
-        loop_thr = st.number_input("Порог зацикленности (loop_score ≥)", min_value=0, value=int(auto_loop_thr), step=1)
-        over_thr = st.number_input("Порог длительности операции (Σ overrun, сек ≥)", min_value=0, value=int(auto_over_thr), step=10)
+        thr_self  = st.number_input("Циклы: в себя (≥)", 0, value=int(thr_self))
+        thr_pp    = st.number_input("Циклы: пинг-понг (≥)", 0, value=int(thr_pp))
+        if use_resource:
+            thr_ppr = st.number_input("Циклы: ресурсный пинг-понг (≥)", 0, value=int(thr_ppr))
     with c2:
-        impact_thr = st.number_input("Порог влияния (impact_sum, сек ≥)", min_value=0, value=int(auto_impact_thr), step=10)
-        frac_bneck_thr = st.number_input("Доля узких рёбер (≥)", min_value=0.0, max_value=1.0,
-                                         value=float(auto_frac_bneck_thr), step=0.05)
+        thr_ret   = st.number_input("Циклы: возвраты A…A (≥)", 0, value=int(thr_ret))
+        thr_jump  = st.number_input("Циклы: прыжки в ранние этапы (≥)", 0, value=int(thr_jump))
+        thr_start = st.number_input("Циклы: возвраты в начало (≥)", 0, value=int(thr_start))
+    with c3:
+        thr_loop_total = st.number_input("Циклы: суммарный score (≥)", 0, value=int(thr_loop_total))
+        thr_over_sum   = st.number_input("Длительность: Σ overrun, сек (≥)", 0, value=int(thr_over_sum), step=10)
+        thr_over_spike = st.number_input("Длительность: экстремальные ожидания (шт ≥)", 0, value=int(thr_over_spike))
+        thr_impact_sum = st.number_input("Влияние: impact_sum (сек ≥)", 0, value=int(thr_impact_sum), step=10)
+        thr_bneck_share = st.number_input("Влияние: доля узких рёбер (≥)", 0.0, 1.0, value=float(thr_bneck_share), step=0.05)
+        thr_exceed_cnt  = st.number_input("Влияние: превышений p95 (шт ≥)", 0, value=int(thr_exceed_cnt))
 
 max_show = st.slider("Сколько примеров-«доказательств» показывать", 1, 20, 5)
 
 # =========================
-# Флаги (бэкенд)
+# ФЛАГИ (все кейсы считаются на бэке)
 # =========================
 loops_merge = loops_df.copy()
-loops_merge["flag_loop"] = loops_merge["loop_score"] >= loop_thr
+loops_merge["flag_self"]   = loops_merge["self_loops"]         >= thr_self
+loops_merge["flag_pp"]     = loops_merge["ping_pong"]           >= thr_pp
+loops_merge["flag_ppr"]    = (loops_merge["ping_pong_res"]     >= thr_ppr) if use_resource else False
+loops_merge["flag_ret"]    = loops_merge["returns_nonadj"]      >= thr_ret
+loops_merge["flag_jump"]   = loops_merge["jump_to_prev_any"]    >= thr_jump
+loops_merge["flag_start"]  = loops_merge["back_to_start"]       >= thr_start
+loops_merge["flag_loop"]   = loops_merge["loop_score_advanced"] >= thr_loop_total
 
 over_merge = over_df.copy()
-over_merge["flag_over"] = over_merge["overrun_sum_sec"] >= over_thr
+over_merge["flag_over_sum"]   = over_merge["overrun_sum_sec"]  >= thr_over_sum
+over_merge["flag_over_spike"] = over_merge["single_spike_cnt"] >= thr_over_spike
+over_merge["flag_queue"]      = over_merge["queue_before_flag"].fillna(False)
 
 impact_merge = impact_df.copy()
-impact_merge["flag_impact"] = (impact_merge["impact_sum_sec"] >= impact_thr) | \
-                              (impact_merge["frac_bottleneck_edges"] >= frac_bneck_thr)
+impact_merge["flag_imp_sum"]  = impact_merge["impact_sum_sec"] >= thr_impact_sum
+impact_merge["flag_imp_share"] = impact_merge["bneck_share"]   >= thr_bneck_share
+impact_merge["flag_imp_exceed"] = impact_merge["p95_exceed_cnt"] >= thr_exceed_cnt
 
-summary = (loops_merge[["case_id", "loop_score", "flag_loop"]]
-           .merge(over_merge[["case_id", "overrun_sum_sec", "flag_over"]], on="case_id", how="outer")
-           .merge(impact_merge[["case_id", "impact_sum_sec", "frac_bottleneck_edges", "flag_impact"]],
-                  on="case_id", how="outer"))
-summary["any_flag"] = summary[["flag_loop", "flag_over", "flag_impact"]].fillna(False).any(axis=1)
-
-# =========================
-# Вывод (коротко)
-# =========================
-st.header("🧪 Результаты по индикаторам")
+summary = (loops_merge[["case_id", "flag_self","flag_pp","flag_ppr","flag_ret","flag_jump","flag_start","flag_loop"]]
+           .merge(over_merge[["case_id","flag_over_sum","flag_over_spike","flag_queue"]], on="case_id", how="outer")
+           .merge(impact_merge[["case_id","flag_imp_sum","flag_imp_share","flag_imp_exceed"]], on="case_id", how="outer"))
+summary = summary.fillna(False)
+summary["any_flag"] = summary.drop(columns=["case_id"]).any(axis=1)
 
 def download_df_button(df_to_dl: pd.DataFrame, filename: str, label: str):
     csv = df_to_dl.to_csv(index=False).encode("utf-8")
     st.download_button(label, csv, file_name=filename, mime="text/csv")
 
-# 1) Зацикленность
-st.subheader("1) Зацикленность (повторы/циклы)")
-bad_loops = loops_merge[loops_merge["flag_loop"]].copy()
-count_bad = int(bad_loops.shape[0])
-st.write(f"Наличие неэффективности: **{'Да' if count_bad>0 else 'Нет'}**  • Затронуто кейсов: **{count_bad}** из {n_cases}")
-if count_bad > 0:
-    show = bad_loops.sort_values("loop_score", ascending=False).head(max_show)
-    st.markdown("**Показательные кейсы:**")
-    for _, r in show.iterrows():
-        st.markdown(f"- **{r['case_id']}** — loop_score={int(r['loop_score'])} "
-                    f"(rework={int(r['rework_total'])}, A→A={int(r['adjacent_loops'])}, A…A={int(r['cycle_returns'])}, AB…AB={int(r['ab_cycle'])})")
-    with st.expander("⬇️ Все кейсы с зацикленностью"):
-        download_df_button(bad_loops.sort_values("loop_score", ascending=False),
-                           "ineff_loops_cases.csv", "Скачать CSV")
+# =========================
+# ВЫВОД (только факты + короткие примеры)
+# =========================
+st.header("🧪 Результаты по индикаторам и подтипам")
 
-# 2) Длительность операции
-st.subheader("2) Длительность операции (перерасход времени)")
-bad_over = over_merge[over_merge["flag_over"]].copy()
-count_bad_over = int(bad_over.shape[0])
-st.write(f"Наличие неэффективности: **{'Да' if count_bad_over>0 else 'Нет'}**  • Затронуто кейсов: **{count_bad_over}** из {n_cases}")
-if count_bad_over > 0:
-    show = bad_over.sort_values("overrun_sum_sec", ascending=False).head(max_show)
-    st.markdown("**Показательные кейсы:**")
-    for _, r in show.iterrows():
-        st.markdown(f"- **{r['case_id']}** — Σ overrun = {int(r['overrun_sum_sec'])} сек")
-    with st.expander("⬇️ Все кейсы с перерасходом"):
-        download_df_button(bad_over.sort_values("overrun_sum_sec", ascending=False),
-                           "ineff_duration_cases.csv", "Скачать CSV")
+def show_section(title: str, df_bad: pd.DataFrame, sort_cols, fmt_row, csv_name: str):
+    st.subheader(title)
+    n_bad = int(df_bad.shape[0])
+    st.write(f"Наличие неэффективности: **{'Да' if n_bad>0 else 'Нет'}**  • Затронуто кейсов: **{n_bad}** из {n_cases}")
+    if n_bad > 0:
+        show = df_bad.sort_values(sort_cols, ascending=False).head(max_show)
+        st.markdown("**Показательные кейсы (доказательства):**")
+        for _, r in show.iterrows():
+            st.markdown(fmt_row(r))
+        with st.expander("⬇️ Выгрузка полного списка"):
+            download_df_button(df_bad.sort_values(sort_cols, ascending=False), csv_name, "Скачать CSV")
 
-# 3) Влияние на процесс
-st.subheader("3) Влияние на процесс (участие в узких местах)")
-bad_impact = impact_merge[impact_merge["flag_impact"]].copy()
-count_bad_impact = int(bad_impact.shape[0])
-st.write(f"Наличие неэффективности: **{'Да' if count_bad_impact>0 else 'Нет'}**  • Затронуто кейсов: **{count_bad_impact}** из {n_cases}")
-if count_bad_impact > 0:
-    show = bad_impact.sort_values(["impact_sum_sec", "frac_bottleneck_edges"], ascending=False).head(max_show)
-    st.markdown("**Показательные кейсы:**")
-    for _, r in show.iterrows():
-        st.markdown(f"- **{r['case_id']}** — impact_sum={int(r['impact_sum_sec'])} сек, доля узких рёбер={r['frac_bottleneck_edges']:.2f}")
-    with st.expander("⬇️ Все кейсы с влиянием"):
-        download_df_button(bad_impact.sort_values(["impact_sum_sec", "frac_bottleneck_edges"], ascending=False),
-                           "ineff_impact_cases.csv", "Скачать CSV")
+# --- Циклы: общий флаг ---
+show_section(
+    "1) Циклы — суммарный score",
+    loops_merge[loops_merge["flag_loop"]],
+    ["loop_score_advanced"],
+    lambda r: f"- **{r['case_id']}** — score={int(r['loop_score_advanced'])} (в себя={int(r['self_loops'])}, "
+              f"пинг-понг={int(r['ping_pong'])}{', ресурсный='+str(int(r['ping_pong_res'])) if use_resource else ''}, "
+              f"возвраты={int(r['returns_nonadj'])}, прыжки={int(r['jump_to_prev_any'])}, в начало={int(r['back_to_start'])})",
+    "ineff_cycles_total.csv"
+)
 
-st.header("📋 Сводка фактов")
-total_any = int(summary["any_flag"].sum())
-st.write(
-    f"- Зацикленность: **{count_bad}** кейсов.\n"
-    f"- Длительность операций: **{count_bad_over}** кейсов.\n"
-    f"- Влияние на процесс: **{count_bad_impact}** кейсов.\n"
-    f"- Любая неэффективность: **{total_any}** из {n_cases}."
+# --- Циклы: подтипы отдельно ---
+show_section(
+    "1.1) Циклы — в себя (A→A)",
+    loops_merge[loops_merge["flag_self"]][["case_id","self_loops"]],
+    ["self_loops"],
+    lambda r: f"- **{r['case_id']}** — A→A: {int(r['self_loops'])}",
+    "ineff_cycle_self.csv"
+)
+show_section(
+    "1.2) Циклы — пинг-понг (ABAB)",
+    loops_merge[loops_merge["flag_pp"]][["case_id","ping_pong"]],
+    ["ping_pong"],
+    lambda r: f"- **{r['case_id']}** — ABAB: {int(r['ping_pong'])}",
+    "ineff_cycle_pingpong.csv"
+)
+if use_resource:
+    show_section(
+        "1.3) Циклы — ресурсный пинг-понг (A@R1↔A@R2)",
+        loops_merge[loops_merge["flag_ppr"]][["case_id","ping_pong_res"]],
+        ["ping_pong_res"],
+        lambda r: f"- **{r['case_id']}** — ресурсный ABAB: {int(r['ping_pong_res'])}",
+        "ineff_cycle_pingpong_resource.csv"
+    )
+show_section(
+    "1.4) Циклы — возврат к пройденному шагу (A…A, не соседние)",
+    loops_merge[loops_merge["flag_ret"]][["case_id","returns_nonadj"]],
+    ["returns_nonadj"],
+    lambda r: f"- **{r['case_id']}** — возвратов: {int(r['returns_nonadj'])}",
+    "ineff_cycle_returns.csv"
+)
+show_section(
+    "1.5) Циклы — прыжки в произвольный ранний этап",
+    loops_merge[loops_merge["flag_jump"]][["case_id","jump_to_prev_any"]],
+    ["jump_to_prev_any"],
+    lambda r: f"- **{r['case_id']}** — «откатов» переходом: {int(r['jump_to_prev_any'])}",
+    "ineff_cycle_backjumps.csv"
+)
+show_section(
+    "1.6) Циклы — возврат в начало",
+    loops_merge[loops_merge["flag_start"]][["case_id","back_to_start"]],
+    ["back_to_start"],
+    lambda r: f"- **{r['case_id']}** — возвратов к стартовой активности: {int(r['back_to_start'])}",
+    "ineff_cycle_back_to_start.csv"
+)
+
+# --- Длительность операций: подтипы ---
+show_section(
+    "2) Длительность — суммарный перерасход",
+    over_merge[over_merge["flag_over_sum"]][["case_id","overrun_sum_sec"]],
+    ["overrun_sum_sec"],
+    lambda r: f"- **{r['case_id']}** — Σ overrun={int(r['overrun_sum_sec'])} сек",
+    "ineff_duration_overrun.csv"
+)
+show_section(
+    "2.1) Длительность — экстремальные ожидания (Δ > p99(edge))",
+    over_merge[over_merge["flag_over_spike"]][["case_id","single_spike_cnt"]],
+    ["single_spike_cnt"],
+    lambda r: f"- **{r['case_id']}** — экстремумов: {int(r['single_spike_cnt'])}",
+    "ineff_duration_spikes.csv"
+)
+show_section(
+    "2.2) Длительность — «очередь» перед активностью",
+    over_merge[over_merge["flag_queue"]][["case_id","queue_target"]],
+    ["queue_target"],
+    lambda r: f"- **{r['case_id']}** — концентрация ожидания перед: **{r['queue_target']}**",
+    "ineff_duration_queue.csv"
+)
+
+# --- Влияние на процесс: подтипы ---
+show_section(
+    "3) Влияние — impact_sum (сверх p95)",
+    impact_merge[impact_merge["flag_imp_sum"]][["case_id","impact_sum_sec"]],
+    ["impact_sum_sec"],
+    lambda r: f"- **{r['case_id']}** — impact_sum={int(r['impact_sum_sec'])} сек",
+    "ineff_impact_sum.csv"
+)
+show_section(
+    "3.1) Влияние — доля рёбер из глобальных «узких»",
+    impact_merge[impact_merge["flag_imp_share"]][["case_id","bneck_share"]],
+    ["bneck_share"],
+    lambda r: f"- **{r['case_id']}** — доля узких рёбер={r['bneck_share']:.2f}",
+    "ineff_impact_share.csv"
+)
+show_section(
+    "3.2) Влияние — количество превышений p95",
+    impact_merge[impact_merge["flag_imp_exceed"]][["case_id","p95_exceed_cnt"]],
+    ["p95_exceed_cnt"],
+    lambda r: f"- **{r['case_id']}** — превышений p95: {int(r['p95_exceed_cnt'])}",
+    "ineff_impact_exceed.csv"
 )
 
 # =========================
-# DFG + PNG: с фоллбэком
+# Сводка фактов
 # =========================
-with st.expander("📌 Карта процесса (DFG) и экспорт PNG", expanded=True):
+st.header("📋 Сводка фактов")
+total_any = int(summary["any_flag"].sum())
+st.write(
+    f"- Циклы (любой подтип или суммарный score): **{int(loops_merge[['flag_self','flag_pp','flag_ppr','flag_ret','flag_jump','flag_start','flag_loop']].any(axis=1).sum())}** кейсов.\n"
+    f"- Длительность (какой-либо подтип): **{int(over_merge[['flag_over_sum','flag_over_spike','flag_queue']].any(axis=1).sum())}** кейсов.\n"
+    f"- Влияние (какой-либо подтип): **{int(impact_merge[['flag_imp_sum','flag_imp_share','flag_imp_exceed']].any(axis=1).sum())}** кейсов.\n"
+    f"- Любая неэффективность: **{total_any}** из {n_cases}."
+)
+with st.expander("⬇️ Экспорт полной сводки по флагам"):
+    download_df_button(summary, "ineff_summary_all_flags.csv", "Скачать CSV")
+
+# =========================
+# DFG + PNG экспорт (graphviz / fallback)
+# =========================
+with st.expander("📌 Карта процесса (DFG) и экспорт PNG", expanded=False):
     dfg_mode = st.radio("Метрика карты", ["Frequency", "Performance"], horizontal=True, key="dfg_mode")
     if dfg_mode == "Frequency":
         dfg, sa, ea = pm4py.discover_dfg(event_log)
@@ -355,18 +557,12 @@ with st.expander("📌 Карта процесса (DFG) и экспорт PNG",
     else:
         dfg, sa, ea = pm4py.discover_performance_dfg(event_log)
         variant = dfg_visualizer.Variants.PERFORMANCE
-
-    params = {"start_activities": sa, "end_activities": ea}
-    gviz = dfg_visualizer.apply(dfg, log=event_log, variant=variant, parameters=params)
-
+    gviz = dfg_visualizer.apply(dfg, log=event_log, variant=variant, parameters={"start_activities": sa, "end_activities": ea})
     st.graphviz_chart(gviz.source, use_container_width=True)
 
-    has_dot = shutil.which("dot") is not None
-
-    # 1) Кнопка DOT (всегда доступна)
     st.download_button("⬇️ DOT", gviz.source.encode("utf-8"), file_name="process_dfg.dot", mime="text/plain")
 
-    # 2) Красивый PNG через graphviz, если есть 'dot'
+    has_dot = shutil.which("dot") is not None
     if has_dot:
         try:
             with tempfile.TemporaryDirectory() as tmpd:
@@ -377,22 +573,13 @@ with st.expander("📌 Карта процесса (DFG) и экспорт PNG",
         except Exception as e:
             st.warning(f"PNG через graphviz не удалось: {e}")
 
-    # 3) Фоллбэк PNG без graphviz — рисуем DFG сами через networkx/matplotlib
     if not has_dot:
-        st.info("Graphviz ('dot') не найден. Использую упрощённый рендер PNG без graphviz.")
+        st.info("Graphviz ('dot') не найден — рендерю упрощённый PNG.")
         try:
-            # Собираем граф
+            # Готовим граф для фоллбэка
             G = nx.DiGraph()
-            # Узлы: старт/финиш + активности
-            for a in set(list(dfg.keys()) + list(sa.keys()) + list(ea.keys())):
-                if isinstance(a, tuple):  # защита от неожиданных ключей
-                    continue
-                G.add_node(a)
-            # Рёбра с весами
             for (u, v), w in dfg.items():
-                G.add_edge(u, v, weight=w)
-
-            # Layout
+                G.add_edge(str(u), str(v), weight=w)
             pos = nx.spring_layout(G, k=1.2, seed=42)
             fig, ax = plt.subplots(figsize=(12, 6))
             nx.draw_networkx_nodes(G, pos, node_size=1200, ax=ax)
@@ -401,7 +588,6 @@ with st.expander("📌 Карта процесса (DFG) и экспорт PNG",
             edge_labels = {(u, v): f"{data.get('weight', '')}" for u, v, data in G.edges(data=True)}
             nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels, font_size=7, ax=ax)
             ax.axis('off')
-
             buf = io.BytesIO()
             plt.tight_layout()
             fig.savefig(buf, format="png", dpi=200)
@@ -409,6 +595,4 @@ with st.expander("📌 Карта процесса (DFG) и экспорт PNG",
             st.download_button("⬇️ PNG (fallback)", buf, file_name="process_dfg_fallback.png", mime="image/png")
             st.pyplot(fig, use_container_width=True)
         except Exception as e:
-            st.warning(f"Фоллбэк PNG тоже не удался: {e}\nПопробуйте установить system graphviz.")
-
-st.success("Готово.")
+            st.warning(f"Фоллбэк PNG не удался: {e}. Поставь `graphviz`.")
